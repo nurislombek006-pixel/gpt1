@@ -1,0 +1,9 @@
+.env
+.env.*
+private
+data
+*.session*
+*.sqlite3*
+__pycache__
+.git
+test_server.py
