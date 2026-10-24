@@ -22,11 +22,56 @@ def status(task, configured):
     return 'starting_or_running'
 
 
+class TelegramRuntime:
+    """One connection lifecycle; the web process exclusively owns OS signals."""
+    def __init__(self, runner=telegram_main, retry_delay=5):
+        self.runner = runner
+        self.retry_delay = retry_delay
+        self.state = 'connecting'
+
+    def ready(self):
+        self.state = 'ready'
+
+    async def run(self):
+        delay = self.retry_delay
+        while True:
+            try:
+                await self.runner(handle_signals=False, on_ready=self.ready)
+                reason = 'disconnected'
+            except asyncio.CancelledError:
+                self.state = 'stopped'
+                raise
+            except Exception as exc:
+                reason = type(exc).__name__
+                # Revoked/duplicated authorization needs the owner, not a retry loop.
+                if reason in {'AuthKeyDuplicatedError', 'AuthKeyUnregisteredError',
+                              'SessionRevokedError', 'UserDeactivatedBanError',
+                              'AccessTokenInvalidError', 'AccessTokenExpiredError',
+                              'KeyError', 'ValueError', 'RuntimeError'}:
+                    self.state = 'connection_failed'
+                    print('Telegram requires owner attention: ' + reason, flush=True)
+                    return
+            self.state = 'reconnecting'
+            print(f'Telegram reconnecting after {reason}; retry in {delay}s', flush=True)
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                self.state = 'stopped'
+                raise
+            self.state = 'connecting'
+            delay = min(max(delay * 2, self.retry_delay), 60)
+
+
 def page(state):
     messages = {
         'needs_configuration': 'Сервер работает. Владелец должен один раз заполнить приватные переменные Telegram в Render.',
         'connection_stopped': 'Сервер работает, но подключение Telegram остановилось. Владелец должен проверить настройки и логи Render.',
         'starting_or_running': 'Загрузчик запущен. Открой @frodgrambot и отправь /media. Первое подключение и поиск чатов могут занять время.',
+        'connecting': 'Подключаю Telegram. Обнови страницу через несколько секунд, затем отправь боту /media.',
+        'ready': 'Telegram подключён. Открой @frodgrambot, отправь /media или ссылку на медиа. Поиск чатов при первом запуске может занять время.',
+        'reconnecting': 'Восстанавливаю соединение с Telegram. Обнови страницу через несколько секунд.',
+        'connection_failed': 'Не удалось подключить Telegram. Владелец должен проверить сессию аккаунта и настройки Render.',
+        'stopped': 'Сервер завершает работу. Открой эту страницу снова через минуту.',
     }
     return ('<!doctype html><html lang="ru"><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -46,7 +91,8 @@ def page(state):
 async def run():
     configured = all(os.environ.get(k) for k in REQUIRED)
     # Keep startup inexpensive: the HTTP port opens without credentials.
-    telegram = asyncio.create_task(telegram_main()) if configured else None
+    runtime = TelegramRuntime() if configured else None
+    telegram = asyncio.create_task(runtime.run()) if runtime else None
     stop = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError):
@@ -59,7 +105,7 @@ async def run():
                 return
             first = raw.split(b'\r\n', 1)[0].decode('ascii', errors='replace').split()
             method, path = first[:2] if len(first) >= 2 else ('', '')
-            state = status(telegram, configured)
+            state = runtime.state if runtime else 'needs_configuration'
             code, mime = '200 OK', 'text/html; charset=utf-8'
             body = page(state)
             if method not in ('GET', 'HEAD'):
@@ -87,13 +133,7 @@ async def run():
     stopped = asyncio.create_task(stop.wait())
     try:
         async with server:
-            await asyncio.wait([stopped] + ([telegram] if telegram else []), return_when=asyncio.FIRST_COMPLETED)
-            if telegram and telegram.done():
-                # Report only an exception class; keep HTTP available for diagnostics.
-                if not telegram.cancelled():
-                    exc = telegram.exception()
-                    print('Telegram stopped: ' + (type(exc).__name__ if exc else 'disconnected'), flush=True)
-                await stopped
+            await stopped
     finally:
         stopped.cancel()
         if telegram:

@@ -275,7 +275,7 @@ class App:
                 self.current = None
 
 
-async def main():
+async def main(*, handle_signals=True, on_ready=None):
     os.umask(0o077)
     api_id = int(os.environ['TG_API_ID'])
     api_hash = os.environ['TG_API_HASH']
@@ -296,9 +296,10 @@ async def main():
     app = None
     tasks = []
     stop = asyncio.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        with contextlib.suppress(NotImplementedError):
-            asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+    if handle_signals:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError):
+                asyncio.get_running_loop().add_signal_handler(sig, stop.set)
     try:
         await user.connect()
         if not await user.is_user_authorized():
@@ -335,12 +336,16 @@ async def main():
         tasks.append(asyncio.create_task(app.worker()))
         tasks.append(asyncio.create_task(stop.wait()))
         print('Media companion ready. Owner can send /media to the bot.', flush=True)
+        if on_ready:
+            on_ready()
         await asyncio.wait([tasks[-1], bot.disconnected, user.disconnected], return_when=asyncio.FIRST_COMPLETED)
     finally:
         if app:
             app.shutting_down = True
             if app.current:
                 app.current.cancel()
+            if getattr(app, 'refresh_task', None) and app.refresh_task not in tasks:
+                tasks.append(app.refresh_task)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

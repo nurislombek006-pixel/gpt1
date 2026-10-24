@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import socket
@@ -7,7 +8,62 @@ import unittest
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from web import page, status
+from web import TelegramRuntime, page, status
+
+
+class ReconnectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disconnect_restarts_and_marks_ready(self):
+        calls = []
+        connected_again = asyncio.Event()
+
+        async def runner(**kwargs):
+            calls.append(kwargs['handle_signals'])
+            kwargs['on_ready']()
+            if len(calls) == 1:
+                return  # Unexpected disconnect of the first connection.
+            connected_again.set()
+            await asyncio.Event().wait()
+
+        runtime = TelegramRuntime(runner, retry_delay=0.01)
+        task = asyncio.create_task(runtime.run())
+        try:
+            await asyncio.wait_for(connected_again.wait(), 1)
+            self.assertEqual(calls, [False, False])
+            self.assertEqual(runtime.state, 'ready')
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(runtime.state, 'stopped')
+        self.assertEqual(len(calls), 2)
+
+    async def test_fatal_configuration_does_not_loop(self):
+        async def runner(**kwargs):
+            raise ValueError('invalid private configuration')
+        runtime = TelegramRuntime(runner, retry_delay=0.01)
+        await asyncio.wait_for(runtime.run(), 1)
+        self.assertEqual(runtime.state, 'connection_failed')
+
+    async def test_transient_exception_retries(self):
+        ready = asyncio.Event()
+        calls = 0
+        async def runner(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ConnectionError('network interruption')
+            kwargs['on_ready']()
+            ready.set()
+            await asyncio.Event().wait()
+        runtime = TelegramRuntime(runner, retry_delay=0.01)
+        task = asyncio.create_task(runtime.run())
+        try:
+            await asyncio.wait_for(ready.wait(), 1)
+            self.assertEqual(runtime.state, 'ready')
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
 class WebTests(unittest.TestCase):
     def test_status_does_not_promise_telegram_ready(self):
