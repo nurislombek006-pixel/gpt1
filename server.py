@@ -6,6 +6,7 @@ import secrets
 import shutil
 import signal
 import tempfile
+import time
 from pathlib import Path
 
 from telethon import Button, TelegramClient, errors, events, utils
@@ -19,6 +20,51 @@ HELP = ('Медиа\n\nПришли ссылку на сообщение — п�
         '/media_cancel — отменить все задания\n/media_refresh — обновить список чатов')
 
 
+class TransferProgress:
+    """One editable message per job; UI failures must not interrupt media delivery."""
+    def __init__(self, bot, peer):
+        self.bot, self.peer = bot, peer
+        self.message = None
+        self.lock = asyncio.Lock()
+        self.percent = 0
+        self.file_index, self.file_count = 0, 1
+        self.next_edit = 0
+        self.last_text = None
+
+    async def show(self, text, force=False):
+        async with self.lock:
+            now = time.monotonic()
+            if self.message and (now < self.next_edit and not force):
+                return
+            if text == self.last_text:
+                return
+            try:
+                if self.message is None:
+                    self.message = await self.bot.send_message(self.peer, text, parse_mode=None)
+                else:
+                    await self.message.edit(text, parse_mode=None)
+                self.last_text = text
+                self.next_edit = now + 3
+            except errors.FloodWaitError as exc:
+                self.next_edit = now + exc.seconds + 1
+            except Exception:
+                self.next_edit = now + 5
+
+    async def update(self, received=0, total=0, *, upload=False, complete=False):
+        value = int(50 * received / total) if total else 0
+        value = min(99, (50 if upload else 0) + value)
+        value = int((self.file_index * 100 + value) / self.file_count)
+        self.percent = 100 if complete else max(self.percent, value)
+        filled = self.percent // 10
+        bar = '▰' * filled + '▱' * (10 - filled)
+        await self.show(f'{bar} {self.percent}%', force=complete)
+
+    async def remove(self):
+        if self.message:
+            with contextlib.suppress(Exception):
+                await self.message.delete()
+
+
 class App:
     def __init__(self, user, bot, owner, store, temp_root, max_size):
         self.user, self.bot, self.owner, self.store = user, bot, owner, store
@@ -29,6 +75,7 @@ class App:
         self.current = None
         self.refreshing = False
         self.shutting_down = False
+        self.progress = {}
 
     def allowed(self, event):
         return event.is_private and event.sender_id == self.owner
@@ -37,7 +84,7 @@ class App:
         if self.recipient:
             await self.bot.send_message(self.recipient, text, parse_mode=None, buttons=buttons)
 
-    async def refresh(self):
+    async def refresh(self, notify=False):
         if self.refreshing:
             return
         self.refreshing = True
@@ -51,17 +98,19 @@ class App:
                 if row['id'] not in ids:
                     self.store.db.execute('DELETE FROM dialogs WHERE id=?', (row['id'],))
             self.store.db.commit()
-            await self.say(f'Список обновлён: {len(ids)} чатов. Напиши /media и название.')
+            if notify:
+                await self.say(f'Список обновлён: {len(ids)} чатов.')
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self.say(f'Не удалось обновить список: {type(exc).__name__}. Повтори /media_refresh позже.')
+            if notify:
+                await self.say('Не удалось обновить список чатов. Повтори /media_refresh позже.')
         finally:
             self.refreshing = False
 
-    def start_refresh(self):
+    def start_refresh(self, notify=False):
         if getattr(self, 'refresh_task', None) is None or self.refresh_task.done():
-            self.refresh_task = asyncio.create_task(self.refresh())
+            self.refresh_task = asyncio.create_task(self.refresh(notify=notify))
 
     async def search(self, text):
         rows = self.store.search(text)
@@ -96,7 +145,9 @@ class App:
             await self.say('Сервер перезапускается. Повтори запрос через минуту.')
             return
         job = self.store.enqueue(payload)
-        await self.say(f'Задание №{job} добавлено. /media_status — состояние, /media_cancel — отмена.')
+        tracker = TransferProgress(self.bot, self.recipient)
+        self.progress[job] = tracker
+        await tracker.update()
 
     async def on_message(self, event):
         if not self.allowed(event):
@@ -108,6 +159,9 @@ class App:
         try:
             if command == '/media_cancel':
                 self.store.cancel_queued()
+                for queued_id, tracker in list(self.progress.items()):
+                    await tracker.remove()
+                    self.progress.pop(queued_id, None)
                 if self.current and not self.current.done():
                     self.current.cancel()
                 await self.say('Отмена запрошена. Уже отправленные файлы останутся в чате.')
@@ -119,7 +173,7 @@ class App:
                                          f"пропущено {r['skipped']}, ошибок {r['errors']}" for r in rows)
                                or 'Очередь пуста.')
             elif command == '/media_refresh':
-                self.start_refresh()
+                self.start_refresh(notify=True)
                 await self.say('Обновляю список чатов в фоне. Ссылки на сообщения уже можно присылать.')
             elif command == '/media':
                 if arg.strip():
@@ -173,20 +227,25 @@ class App:
         except Exception as exc:
             await self.say(f'Ошибка кнопки: {type(exc).__name__}. Повтори запрос.')
 
-    async def deliver(self, job, chat, msg):
+    async def deliver(self, job, chat, msg, *, tracker=None, repeat=False):
         if not msg or not (msg.photo or msg.document):
             return
-        if self.store.seen(chat, msg.id):
+        if not repeat and self.store.seen(chat, msg.id):
             self.store.count(job, 'skipped')
             return
         if (msg.file.size or 0) > self.max_size:
-            self.store.count(job, 'errors')
-            await self.say(f'Сообщение {msg.id}: файл больше лимита сервера ({self.max_size//1024**2} МБ).')
-            return
+            raise ValueError(f'Файл больше лимита сервера ({self.max_size//1024**2} МБ)')
         # Limit checks are repeated while downloading, including files with unknown size.
-        def progress(received, total):
+        async def progress(received, total):
             if received > self.max_size:
                 raise ValueError('Файл больше лимита сервера')
+            if tracker:
+                await tracker.update(received, total)
+
+        async def upload_progress(received, total):
+            if tracker:
+                await tracker.update(received, total, upload=True)
+
         for attempt in range(3):
             try:
                 with tempfile.TemporaryDirectory(prefix='media_', dir=self.temp_root) as temp:
@@ -202,7 +261,7 @@ class App:
                         raise ValueError('Скачан неполный файл')
                     sent = await self.bot.send_file(
                         self.recipient, str(path), parse_mode=None,
-                        caption=f'Источник: {chat} · сообщение {msg.id}\n{msg.message or ""}'[:900],
+                        caption='', progress_callback=upload_progress,
                         force_document=bool(msg.document),
                         attributes=msg.document.attributes if msg.document else None,
                         mime_type=msg.file.mime_type)
@@ -212,7 +271,8 @@ class App:
             except errors.FloodWaitError as exc:
                 if attempt == 2:
                     raise
-                await self.say(f'Telegram просит паузу: {exc.seconds} сек. Задание продолжится автоматически.')
+                if tracker:
+                    await tracker.show(f'Пауза Telegram: {exc.seconds} сек.', force=True)
                 await asyncio.sleep(exc.seconds + 1)
             except (OSError, asyncio.TimeoutError):
                 if attempt == 2:
@@ -220,7 +280,8 @@ class App:
                 await asyncio.sleep(2 ** attempt)
 
     async def job(self, job, payload):
-        await self.say(f'Задание №{job}: начинаю.')
+        tracker = self.progress.setdefault(job, TransferProgress(self.bot, self.recipient))
+        await tracker.update()
         entity = await self.user.get_entity(payload['chat'])
         chat_id = utils.get_peer_id(entity)
         found = 0
@@ -228,25 +289,29 @@ class App:
             msg = await self.user.get_messages(entity, ids=payload['message'])
             if not msg or not (msg.photo or msg.document):
                 raise ValueError('В сообщении нет доступного медиа. Укажи ссылку на само вложение.')
-            await self.deliver(job, chat_id, msg)
+            await self.deliver(job, chat_id, msg, tracker=tracker, repeat=True)
             found = 1
         else:
-            async for msg in self.user.iter_messages(entity, limit=payload['limit']):
-                if not (msg.photo or msg.document):
-                    continue
-                found += 1
+            messages = [msg async for msg in self.user.iter_messages(entity, limit=payload['limit'])
+                        if msg.photo or msg.document]
+            found = len(messages)
+            tracker.file_count = max(1, found)
+            for index, msg in enumerate(messages):
+                tracker.file_index = index
                 try:
-                    await self.deliver(job, chat_id, msg)
+                    await self.deliver(job, chat_id, msg, tracker=tracker)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     self.store.count(job, 'errors')
                     await self.say(f'Сообщение {msg.id} пропущено: {type(exc).__name__}.')
         self.store.state(job, 'done')
-        row = self.store.db.execute('SELECT * FROM jobs WHERE id=?', (job,)).fetchone()
-        await self.say(f"Задание №{job} завершено. Отправлено: {row['sent']}, "
-                       f"уже было: {row['skipped']}, ошибок: {row['errors']}." +
-                       (' В выбранных сообщениях медиа нет.' if not found else ''))
+        if not found:
+            await tracker.show('В выбранных сообщениях медиа нет.', force=True)
+        else:
+            await tracker.update(complete=True)
+            await tracker.remove()
+        self.progress.pop(job, None)
 
     async def worker(self):
         while not self.shutting_down:
@@ -263,6 +328,9 @@ class App:
                 await self.current
             except asyncio.CancelledError:
                 self.store.state(job, 'queued' if self.shutting_down else 'cancelled')
+                tracker = self.progress.pop(job, None)
+                if tracker:
+                    await tracker.remove()
                 if self.shutting_down:
                     return
             except Exception as exc:
@@ -270,7 +338,12 @@ class App:
                 self.store.count(job, 'errors')
                 detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
                 with contextlib.suppress(Exception):
-                    await self.say(f'Задание №{job} остановлено: {detail}. Проверь доступ к исходному сообщению.')
+                    text = f'Не удалось скачать: {detail}.'
+                    tracker = self.progress.pop(job, None)
+                    if tracker:
+                        await tracker.show(text, force=True)
+                    else:
+                        await self.say(text)
             finally:
                 self.current = None
 

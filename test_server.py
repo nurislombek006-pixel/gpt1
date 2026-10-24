@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from core import Store, filename, message_link
-from server import App
+from server import App, TransferProgress
 
 
 class CoreTests(unittest.TestCase):
@@ -65,10 +65,12 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
 
         async def download(msg, file, progress_callback):
             file.write(b'hello')
-            progress_callback(5, 5)
+            await progress_callback(5, 5)
             return 'downloaded'
 
         async def upload(peer, path, **kwargs):
+            self.assertEqual(kwargs['caption'], '')
+            await kwargs['progress_callback'](5, 5)
             self.uploaded.append(Path(path).read_bytes())
             return SimpleNamespace(id=100)
 
@@ -91,6 +93,55 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.store.seen(42, 7))
         self.assertEqual(list(Path(self.temp.name).iterdir()), [])
         self.assertEqual(self.store.status()[0]['skipped'], 1)
+
+    async def test_link_progress_single_message_removed_after_delivery(self):
+        history = []
+        class Status:
+            async def edit(inner, text, **kwargs):
+                history.append(('edit', text))
+            async def delete(inner):
+                history.append(('delete', None))
+        async def send(peer, text, **kwargs):
+            history.append(('send', text))
+            return Status()
+        async def entity(chat):
+            from telethon.tl.types import PeerUser
+            return PeerUser(42)
+        async def messages(entity, ids):
+            return self.msg
+        self.app.bot.send_message = send
+        self.app.user.get_entity = entity
+        self.app.user.get_messages = messages
+        self.store.delivered(42, 7, 99, self.job_id)
+        await self.app.enqueue({'chat': 42, 'message': 7})
+        self.store.next()
+        job, payload = self.store.next()
+        await self.app.job(job, payload)
+        self.assertEqual(self.uploaded, [b'hello'])
+        self.assertEqual(sum(item[0] == 'send' for item in history), 1)
+        self.assertTrue(history[0][1].endswith('0%'))
+        self.assertEqual(history[-2], ('edit', '▰' * 10 + ' 100%'))
+        self.assertEqual(history[-1][0], 'delete')
+        self.assertFalse(self.app.progress)
+
+    async def test_progress_download_upload_throttling(self):
+        edits = []
+        class Status:
+            async def edit(inner, text, **kwargs):
+                edits.append(text)
+        async def send(*args, **kwargs):
+            return Status()
+        tracker = TransferProgress(SimpleNamespace(send_message=send), 'owner')
+        await tracker.update()
+        await tracker.update(50, 100)
+        self.assertEqual(tracker.percent, 25)
+        self.assertFalse(edits)
+        tracker.next_edit = 0
+        await tracker.update(50, 100, upload=True)
+        self.assertEqual(tracker.percent, 75)
+        self.assertTrue(edits[-1].endswith('75%'))
+        await tracker.update(100, 100, upload=True)
+        self.assertEqual(tracker.percent, 99)
 
     async def test_failed_upload_cleans_and_does_not_mark_delivered(self):
         async def failed(*args, **kwargs):
