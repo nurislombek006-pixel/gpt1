@@ -50,7 +50,7 @@ async def main():
                 return
         content = (f'TG_API_ID={api_id}\nTG_API_HASH={api_hash}\nTG_BOT_TOKEN={token}\n'
                    f'TG_OWNER_ID={me.id}\nTG_USER_SESSION={session}\n'
-                   'TG_BOT_USERNAME=frodgrambot\nDATA_DIR=/data\nMAX_FILE_MB=1900\n')
+                   'TG_BOT_USERNAME=frodgrambot\nDATA_DIR=/tmp/media-data\nMAX_FILE_MB=500\n')
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as output:
             output.write(content)

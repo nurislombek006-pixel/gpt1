@@ -3,5 +3,5 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 DATA_DIR=/data
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY core.py server.py ./
-CMD ["python", "server.py"]
+COPY core.py server.py web.py ./
+CMD ["python", "web.py"]

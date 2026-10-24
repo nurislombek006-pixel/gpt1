@@ -1,16 +1,12 @@
-# Creates paid resources only after the owner reviews and applies this Blueprint.
+# Free web service; no disk, payment method or continuously running worker.
 services:
-  - type: worker
+  - type: web
     name: gpt1
     runtime: python
-    plan: 0.5c-512mb
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python server.py
+    startCommand: python web.py
     numInstances: 1
-    disk:
-      name: media-data
-      mountPath: /data
-      sizeGB: 3
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.12"
@@ -27,6 +23,6 @@ services:
       - key: TG_USER_SESSION
         sync: false
       - key: DATA_DIR
-        value: /data
+        value: /tmp/media-data
       - key: MAX_FILE_MB
-        value: "1900"
+        value: "500"

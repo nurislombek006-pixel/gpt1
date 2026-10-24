@@ -3,6 +3,10 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    ports:
+      - "127.0.0.1:10000:10000"
+    environment:
+      DATA_DIR: /data
     volumes:
       - media-data:/data
     stop_grace_period: 30s
