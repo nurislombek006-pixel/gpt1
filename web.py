@@ -14,6 +14,19 @@ from server import main as telegram_main
 REQUIRED = ('TG_API_ID', 'TG_API_HASH', 'TG_BOT_TOKEN', 'TG_OWNER_ID', 'TG_USER_SESSION')
 
 
+def startup_diagnostic(exc):
+    """Log only known static checks; never log arbitrary exception text."""
+    checks = {
+        'User session is not authorized; run prepare_server.py locally': 'user_session_not_authorized',
+        'Owner does not match session': 'owner_session_mismatch',
+        'Bot does not match token': 'bot_token_mismatch',
+        'Bot username does not match expected bot': 'bot_username_mismatch',
+    }
+    if type(exc) is RuntimeError:
+        return checks.get(str(exc), 'runtime_error')
+    return type(exc).__name__
+
+
 def status(task, configured):
     if not configured:
         return 'needs_configuration'
@@ -49,7 +62,7 @@ class TelegramRuntime:
                               'AccessTokenInvalidError', 'AccessTokenExpiredError',
                               'KeyError', 'ValueError', 'RuntimeError'}:
                     self.state = 'connection_failed'
-                    print('Telegram requires owner attention: ' + reason, flush=True)
+                    print('Telegram requires owner attention: ' + startup_diagnostic(exc), flush=True)
                     return
             self.state = 'reconnecting'
             print(f'Telegram reconnecting after {reason}; retry in {delay}s', flush=True)
@@ -143,3 +156,4 @@ async def run():
 
 if __name__ == '__main__':
     asyncio.run(run())
+

@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import json
 import os
 import socket
@@ -8,10 +10,24 @@ import unittest
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from web import TelegramRuntime, page, status
+from web import TelegramRuntime, page, status, startup_diagnostic
 
 
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_diagnostics_identify_auth_failure_without_private_text(self):
+        async def runner(**kwargs):
+            raise RuntimeError('User session is not authorized; run prepare_server.py locally')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            runtime = TelegramRuntime(runner)
+            await runtime.run()
+        self.assertEqual(runtime.state, 'connection_failed')
+        self.assertIn('user_session_not_authorized', output.getvalue())
+        self.assertEqual(startup_diagnostic(RuntimeError('private-token-and-session')), 'runtime_error')
+        self.assertEqual(startup_diagnostic(RuntimeError('Owner does not match session')), 'owner_session_mismatch')
+        self.assertEqual(startup_diagnostic(RuntimeError('Bot does not match token')), 'bot_token_mismatch')
+        self.assertEqual(startup_diagnostic(RuntimeError('Bot username does not match expected bot')), 'bot_username_mismatch')
+
     async def test_disconnect_restarts_and_marks_ready(self):
         calls = []
         connected_again = asyncio.Event()
@@ -100,3 +116,4 @@ class WebTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
