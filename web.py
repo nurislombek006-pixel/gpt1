@@ -9,7 +9,6 @@ import json
 import os
 import signal
 
-from recovery import Recovery
 from server import main as telegram_main
 
 REQUIRED = ('TG_API_ID', 'TG_API_HASH', 'TG_BOT_TOKEN', 'TG_OWNER_ID', 'TG_USER_SESSION')
@@ -78,7 +77,6 @@ class TelegramRuntime:
 
 def page(state):
     messages = {
-        'paused': 'Подключение бота приостановлено владельцем для восстановления входа в Telegram.',
         'needs_configuration': 'Сервер работает. Владелец должен один раз заполнить приватные переменные Telegram в Render.',
         'connection_stopped': 'Сервер работает, но подключение Telegram остановилось. Владелец должен проверить настройки и логи Render.',
         'starting_or_running': 'Загрузчик запущен. Открой @frodgrambot и отправь /media. Первое подключение и поиск чатов могут занять время.',
@@ -105,10 +103,8 @@ def page(state):
 
 async def run():
     configured = all(os.environ.get(k) for k in REQUIRED)
-    paused = os.environ.get('TG_MEDIA_PAUSED') == '1'
-    recovery = Recovery()
     # Keep startup inexpensive: the HTTP port opens without credentials.
-    runtime = TelegramRuntime() if configured and not paused else None
+    runtime = TelegramRuntime() if configured else None
     telegram = asyncio.create_task(runtime.run()) if runtime else None
     stop = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -122,29 +118,10 @@ async def run():
                 return
             first = raw.split(b'\r\n', 1)[0].decode('ascii', errors='replace').split()
             method, path = first[:2] if len(first) >= 2 else ('', '')
-            fields = raw.split(b'\r\n')[1:-2]
-            request_headers = {}
-            for field in fields:
-                name, sep, value = field.partition(b':')
-                name = name.decode('ascii').lower().strip()
-                if not sep or name in request_headers:
-                    return
-                request_headers[name] = value.decode('ascii').strip()
-            if 'transfer-encoding' in request_headers:
-                return
-            try:
-                length = int(request_headers.get('content-length', '0'))
-            except ValueError:
-                return
-            if not 0 <= length <= 8192:
-                return
-            payload = await asyncio.wait_for(reader.readexactly(length), timeout=10) if length else b''
-            state = 'paused' if paused else runtime.state if runtime else 'needs_configuration'
+            state = runtime.state if runtime else 'needs_configuration'
             code, mime = '200 OK', 'text/html; charset=utf-8'
             body = page(state)
-            if path == '/reconnect' or path.startswith('/reconnect/'):
-                code, mime, body = await recovery.route(method, path, request_headers, payload)
-            elif method not in ('GET', 'HEAD'):
+            if method not in ('GET', 'HEAD'):
                 code, body = '405 Method Not Allowed', b'Method not allowed'
             elif path.split('?', 1)[0] == '/healthz':
                 mime = 'application/json'
@@ -154,11 +131,10 @@ async def run():
             headers = (f'HTTP/1.1 {code}\r\nContent-Type: {mime}\r\n'
                        f'Content-Length: {len(body)}\r\nConnection: close\r\n'
                        'Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n'
-                       "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n"
                        'Referrer-Policy: no-referrer\r\n\r\n').encode()
             writer.write(headers + (b'' if method == 'HEAD' else body))
             await writer.drain()
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, UnicodeError):
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError):
             pass
         finally:
             writer.close()
@@ -173,7 +149,6 @@ async def run():
             await stopped
     finally:
         stopped.cancel()
-        await recovery.close()
         if telegram:
             telegram.cancel()
             await asyncio.gather(telegram, return_exceptions=True)
