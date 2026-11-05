@@ -34,7 +34,16 @@ class FakeClient:
                 raise errors.SessionPasswordNeededError(None)
         return SimpleNamespace(url='private-login-payload', wait=wait)
 
-    async def sign_in(self, *, password):
+    async def send_code_request(self, phone):
+        return None
+
+    async def sign_in(self, *, password=None, phone=None, code=None):
+        if code is not None:
+            if code != '12345':
+                raise errors.PhoneCodeInvalidError(None)
+            if self.password_required:
+                raise errors.SessionPasswordNeededError(None)
+            return
         if password != 'correct-private-password':
             raise errors.PasswordHashInvalidError(None)
 
@@ -127,6 +136,24 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         await obj.close()
         self.assertEqual(obj.state,'stopped')
         self.assertFalse(client.connected)
+
+    async def test_phone_login_and_invalid_code_then_two_factor(self):
+        obj, client=self.make(password=True)
+        await obj.start('phone')
+        await self.until(obj,'phone')
+        self.assertEqual((await obj.phone('invalid'))['state'],'invalid_phone')
+        await obj.phone('+998901234567')
+        await self.until(obj,'code')
+        await obj.code('00000')
+        self.assertEqual(obj.state,'incorrect_code')
+        await obj.code('12345')
+        self.assertEqual(obj.state,'password')
+        with patch('recovery.StringSession.save',return_value='private-session'):
+            await obj.password('correct-private-password')
+            await obj.task
+        self.assertEqual(obj.state,'authorized')
+        self.assertFalse(client.connected)
+        self.assertNotIn('998901234567',json.dumps(obj.status()))
 
 
 if __name__=='__main__':

@@ -36,6 +36,10 @@ class Recovery:
         self.client = None
         self.password_result = None
         self.password_attempts = 0
+        self.phone_result = None
+        self.code_result = None
+        self.phone_number = None
+        self.code_attempts = 0
         self.lock = asyncio.Lock()
         try:
             self.expires = int(self.config.get('TG_RECOVERY_EXPIRES', '0'))
@@ -59,14 +63,14 @@ class Recovery:
     def status(self):
         return {'state': self.state, 'svg': self.svg if self.state == 'qr' else ''}
 
-    async def start(self):
+    async def start(self, mode='qr'):
         async with self.lock:
-            if self.task is None:
+            if self.task is None and mode in ('qr', 'phone'):
                 self.state = 'connecting'
-                self.task = asyncio.create_task(self._run())
+                self.task = asyncio.create_task(self._run(mode))
         return self.status()
 
-    async def _run(self):
+    async def _run(self, mode):
         candidate = ''
         try:
             timeout = min(1800, max(0, self.expires - self.clock()))
@@ -76,22 +80,32 @@ class Recovery:
                                                   device_model='Render media recovery',
                                                   app_version='1.0', flood_sleep_threshold=0)
                 await self.client.connect()
-                while True:
-                    qr = await self.client.qr_login()
-                    self.svg = self.renderer(qr.url)
-                    self.state = 'qr'
-                    try:
-                        # Begin waiting in this task before yielding to HTTP/browser requests.
-                        await qr.wait()
-                        break
-                    except asyncio.TimeoutError:
-                        continue
-                    except errors.SessionPasswordNeededError:
-                        self.svg = ''
-                        self.password_result = asyncio.get_running_loop().create_future()
-                        self.state = 'password'
+                if mode == 'phone':
+                    self.phone_result = asyncio.get_running_loop().create_future()
+                    self.state = 'phone'
+                    self.phone_number = await self.phone_result
+                    await self.client.send_code_request(self.phone_number)
+                    self.code_result = asyncio.get_running_loop().create_future()
+                    self.state = 'code'
+                    needs_password = await self.code_result
+                    if needs_password:
                         await self.password_result
-                        break
+                else:
+                    while True:
+                        qr = await self.client.qr_login()
+                        self.svg = self.renderer(qr.url)
+                        self.state = 'qr'
+                        try:
+                            await qr.wait()
+                            break
+                        except asyncio.TimeoutError:
+                            continue
+                        except errors.SessionPasswordNeededError:
+                            self.svg = ''
+                            self.password_result = asyncio.get_running_loop().create_future()
+                            self.state = 'password'
+                            await self.password_result
+                            break
                 account = await self.client.get_me()
                 if account is None or account.bot or account.id != int(self.config['TG_OWNER_ID']):
                     self.state = 'wrong_owner'
@@ -103,8 +117,9 @@ class Recovery:
             raise
         except TimeoutError:
             self.state = 'expired'
-        except Exception:
+        except Exception as exc:
             self.state = 'failed'
+            print('Telegram recovery failed: ' + type(exc).__name__, flush=True)
         finally:
             self.svg = ''
             if self.client:
@@ -113,6 +128,46 @@ class Recovery:
         if candidate:
             self.session = candidate
             self.state = 'authorized'
+
+    async def phone(self, value):
+        async with self.lock:
+            if self.state != 'phone' or not isinstance(value, str):
+                return self.status()
+            value = ''.join(c for c in value if c not in ' ()-')
+            if not value.startswith('+') or not value[1:].isascii() or not value[1:].isdigit() or not 8 <= len(value) <= 16:
+                return {'state':'invalid_phone'}
+            self.state = 'sending_code'
+            self.phone_result.set_result(value)
+            return self.status()
+
+    async def code(self, value):
+        async with self.lock:
+            if self.state not in ('code', 'incorrect_code'):
+                return self.status()
+            if not isinstance(value, str) or not value.isascii() or not value.isdigit() or not 4 <= len(value) <= 8:
+                return {'state':'incorrect_code'}
+            self.code_attempts += 1
+            if self.code_attempts > 3:
+                self.task.cancel()
+                self.state = 'failed'
+                return self.status()
+            try:
+                await self.client.sign_in(phone=self.phone_number, code=value)
+                self.state = 'verifying'
+                self.code_result.set_result(False)
+            except errors.SessionPasswordNeededError:
+                self.password_result = asyncio.get_running_loop().create_future()
+                self.state = 'password'
+                self.code_result.set_result(True)
+            except errors.PhoneCodeInvalidError:
+                self.state = 'incorrect_code'
+            except errors.PhoneCodeExpiredError:
+                self.task.cancel()
+                self.state = 'expired'
+            except Exception:
+                self.task.cancel()
+                self.state = 'failed'
+            return self.status()
 
     async def password(self, value):
         async with self.lock:
@@ -149,12 +204,21 @@ class Recovery:
         response = {}
         code = '200 OK'
         if method == 'POST' and path == '/reconnect/start':
-            response = await self.start()
+            try:
+                response = await self.start(json.loads(payload or b'{}').get('mode', 'qr'))
+            except (ValueError, AttributeError):
+                code = '400 Bad Request'
         elif method == 'GET' and path == '/reconnect/status':
             response = self.status()
         elif method == 'POST' and path == '/reconnect/password':
             try:
                 response = await self.password(json.loads(payload).get('password'))
+            except (ValueError, AttributeError):
+                code = '400 Bad Request'
+        elif method == 'POST' and path in ('/reconnect/phone', '/reconnect/code'):
+            name = path.rsplit('/', 1)[1]
+            try:
+                response = await getattr(self, name)(json.loads(payload).get(name))
             except (ValueError, AttributeError):
                 code = '400 Bad Request'
         elif method == 'GET' and export:
@@ -178,18 +242,23 @@ PAGE = '''<!doctype html><html lang="ru"><meta charset="utf-8">
 <title>Восстановление Telegram</title>
 <style>body{margin:0;background:#101820;color:#eff7fa;font:17px/1.55 system-ui;min-height:100vh;display:grid;place-items:center}main{max-width:510px;padding:30px}h1{font-size:28px;line-height:1.2}button{background:#75dec4;color:#10201e;border:0;border-radius:12px;padding:14px 20px;font:700 17px system-ui;cursor:pointer}#qr{width:280px;max-width:100%;background:white;margin:24px 0;border-radius:10px}#qr svg{width:100%;height:auto;display:block}input{display:block;box-sizing:border-box;width:100%;font:17px system-ui;padding:14px;border-radius:10px;border:1px solid #789;margin:12px 0}small{color:#9ab0bb}form[hidden],#qr:empty{display:none}</style>
 <main><h1>Восстановление Telegram</h1>
-<p id="state" role="status">Готовлю подключение…</p>
+<p id="state" role="status">Выбери способ входа.</p>
+<div id="choices"><button id="by-phone" type="button">По номеру телефона</button> <button id="by-qr" type="button">QR-код</button></div>
 <div id="qr" aria-label="QR-код входа в Telegram"></div>
+<form id="phone-form" hidden><label for="phone">Телефон Telegram</label><input id="phone" name="phone" type="tel" autocomplete="tel" placeholder="+998…" required><button type="submit">Получить код</button></form>
+<form id="code-form" hidden><label for="code">Код входа Telegram</label><input id="code" name="code" type="text" autocomplete="one-time-code" inputmode="numeric" required><button type="submit">Войти</button></form>
 <form id="password-form" hidden><label for="password">Пароль двухэтапной проверки Telegram</label><input id="password" name="password" type="password" autocomplete="current-password" required><button type="submit">Подтвердить вход</button></form>
 <small>Бот приостановлен. В Telegram открой «Настройки → Устройства → Подключить устройство». Подтверди вход для восстановления своего бота. Данные аккаунта не отображаются на этой странице.</small>
 <script>
 const token=location.hash.slice(1); history.replaceState(null,'','/reconnect');
-const state=document.getElementById('state'),qr=document.getElementById('qr'),form=document.getElementById('password-form');
+const state=document.getElementById('state'),qr=document.getElementById('qr'),form=document.getElementById('password-form'),phoneForm=document.getElementById('phone-form'),codeForm=document.getElementById('code-form'),choices=document.getElementById('choices');
 let lastSvg='';
-const labels={connecting:'Подключаю Telegram…',qr:'Подтверди вход в Telegram по QR-коду.',password:'Telegram запросил пароль двухэтапной проверки.',incorrect_password:'Пароль не подошёл. Проверь и повтори.',verifying:'Проверяю аккаунт…',authorized:'Вход подтверждён. Сохраняю подключение на сервере.',wrong_owner:'Этот аккаунт не совпадает с владельцем бота. Вход отклонён.',failed:'Не удалось завершить вход. Сообщи об этом в чате.',expired:'Время восстановления истекло.',stopped:'Восстановление остановлено.'};
+const labels={idle:'Выбери способ входа.',phone:'Введи номер своего аккаунта Telegram в международном формате.',invalid_phone:'Проверь номер: он должен начинаться с + и кода страны.',sending_code:'Запрашиваю код Telegram…',code:'Введи код, который прислал Telegram.',incorrect_code:'Код не подошёл. Проверь и повтори.',connecting:'Подключаю Telegram…',qr:'Подтверди вход в Telegram по QR-коду.',password:'Telegram запросил пароль двухэтапной проверки.',incorrect_password:'Пароль не подошёл. Проверь и повтори.',verifying:'Проверяю аккаунт…',authorized:'Вход подтверждён. Сохраняю подключение на сервере.',wrong_owner:'Этот аккаунт не совпадает с владельцем бота. Вход отклонён.',failed:'Не удалось завершить вход. Сообщи об этом в чате.',expired:'Время восстановления истекло.',stopped:'Восстановление остановлено.'};
 async function api(path,method='GET',body){const r=await fetch('/reconnect/'+path,{method,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});if(!r.ok)throw Error('unavailable');return r.json()}
-function show(s){state.textContent=labels[s.state]||'Ожидаю подключения…';form.hidden=!['password','incorrect_password'].includes(s.state);if(lastSvg!==s.svg){qr.innerHTML=s.svg||'';lastSvg=s.svg||'';}return !['authorized','wrong_owner','failed','expired','stopped'].includes(s.state)}
+function show(s){state.textContent=labels[s.state]||'Ожидаю подключения…';choices.hidden=s.state!=='idle';phoneForm.hidden=!['phone','invalid_phone'].includes(s.state);codeForm.hidden=!['code','incorrect_code'].includes(s.state);form.hidden=!['password','incorrect_password'].includes(s.state);if(lastSvg!==s.svg){qr.innerHTML=s.svg||'';lastSvg=s.svg||'';}return !['authorized','wrong_owner','failed','expired','stopped'].includes(s.state)}
 async function poll(){try{if(show(await api('status')))setTimeout(poll,2000)}catch{state.textContent='Ссылка восстановления недействительна или сервер недоступен.'}}
 form.addEventListener('submit',async e=>{e.preventDefault();const field=document.getElementById('password'),password=field.value;field.value='';try{show(await api('password','POST',{password}))}catch{state.textContent='Не удалось подтвердить вход.'}});
-if(token){api('start','POST',{}).then(s=>{show(s);poll()}).catch(()=>state.textContent='Ссылка восстановления недействительна.')}else{state.textContent='Открой защищённую ссылку восстановления из текущего сеанса.'}
+for(const name of ['phone','code'])document.getElementById(name+'-form').addEventListener('submit',async e=>{e.preventDefault();const field=document.getElementById(name),value=field.value;field.value='';try{show(await api(name,'POST',{[name]:value}))}catch{state.textContent='Не удалось подтвердить вход.'}});
+for(const mode of ['phone','qr'])document.getElementById('by-'+mode).addEventListener('click',async()=>{try{show(await api('start','POST',{mode}))}catch{state.textContent='Не удалось начать вход.'}});
+if(token){poll()}else{choices.hidden=true;state.textContent='Открой защищённую ссылку восстановления из текущего сеанса.'}
 </script></main></html>'''
